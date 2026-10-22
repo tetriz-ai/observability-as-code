@@ -1,0 +1,1282 @@
+# Unit tests for the asynq queue-health alerts (run via `make test-alerts`).
+# Asserts fire/silent behaviour, not just that the PromQL parses. exp_annotations
+# mirror the rules verbatim on purpose — editing an alert message must update
+# this test, keeping the two in sync.
+rule_files:
+  - ../.extracted/rules-asynq.yaml
+evaluation_interval: 1m
+tests:
+  # Pending > 0 with zero active workers for 30m, not paused -> NotDraining fires (p1).
+  # Two pods report the same gauge; min by (queue) dedupes so $value is 5, not 10.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="emails", state="pending", instance="pod-a"}'
+        values: '5x40'
+      - series: 'asynq_tasks_enqueued_total{queue="emails", state="pending", instance="pod-b"}'
+        values: '5x40'
+      - series: 'asynq_tasks_enqueued_total{queue="emails", state="active", instance="pod-a"}'
+        values: '0x40'
+      - series: 'asynq_tasks_enqueued_total{queue="emails", state="active", instance="pod-b"}'
+        values: '0x40'
+      - series: 'asynq_queue_paused_total{queue="emails", instance="pod-a"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueNotDraining
+        exp_alerts:
+          - exp_labels:
+              severity: p1
+              team: platform
+              queue: emails
+            exp_annotations:
+              summary: "asynq queue emails has a backlog and nothing is processing it"
+              description: "5 tasks have sat pending on the emails queue for 30m with zero active workers on it and the queue is not paused. Possible causes: the worker pool is saturated and this low-priority queue keeps losing the draw (other queues show active > 0 — check the server's Concurrency and Queues priorities); no running server lists this queue in its Config.Queues (a retired queue's leftovers stay in Redis until deleted with Inspector.DeleteQueue); or the worker process is down. Start on the Asynq Queue Health dashboard, Backlog by State."
+
+  # A gap in the samples mid-window must not reset the 30m window: the [5m] range reads
+  # skip it. A failed scrape leaves a staleness marker rather than a gap; promtool writes one
+  # for `stale`, and the failure-rate cases under "A missed scrape" below use it.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="emails", state="pending"}'
+        values: '5x14 _ 5x24'
+      - series: 'asynq_tasks_enqueued_total{queue="emails", state="active"}'
+        values: '0x14 _ 0x24'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueNotDraining
+        exp_alerts:
+          - exp_labels:
+              severity: p1
+              team: platform
+              queue: emails
+            exp_annotations:
+              summary: "asynq queue emails has a backlog and nothing is processing it"
+              description: "5 tasks have sat pending on the emails queue for 30m with zero active workers on it and the queue is not paused. Possible causes: the worker pool is saturated and this low-priority queue keeps losing the draw (other queues show active > 0 — check the server's Concurrency and Queues priorities); no running server lists this queue in its Config.Queues (a retired queue's leftovers stay in Redis until deleted with Inspector.DeleteQueue); or the worker process is down. Start on the Asynq Queue Health dashboard, Backlog by State."
+
+  # Pending > 0 but one worker is active (a slow concurrency-1 queue grinding through a
+  # long task) -> NotDraining stays silent. That is draining, just slowly.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="reports", state="pending"}'
+        values: '5x40'
+      - series: 'asynq_tasks_enqueued_total{queue="reports", state="active"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueNotDraining
+        exp_alerts: []
+
+  # Empty queue with no active workers (an idle queue) -> NotDraining silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="low", state="pending"}'
+        values: '0x40'
+      - series: 'asynq_tasks_enqueued_total{queue="low", state="active"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueNotDraining
+        exp_alerts: []
+
+  # A deliberately paused queue with a backlog -> NotDraining stays silent (an operator
+  # must not be paged p1 for their own pause); QueuePaused names it at p2 after 30m.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="webhooks", state="pending"}'
+        values: '50x40'
+      - series: 'asynq_tasks_enqueued_total{queue="webhooks", state="active"}'
+        values: '0x40'
+      - series: 'asynq_queue_paused_total{queue="webhooks"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueNotDraining
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: AsynqQueuePaused
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks has been paused for over 30m"
+              description: "The webhooks queue is paused, so nothing pulls from it and its backlog only grows. Pausing is a manual Inspector.PauseQueue call and is not undone by a deploy. Unpause it (Inspector.UnpauseQueue) once the incident that motivated it is over."
+
+  # Paused 20m then unpaused -> QueuePaused silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_queue_paused_total{queue="default"}'
+        values: '1x20 0x20'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueuePaused
+        exp_alerts: []
+
+  # Backlog of 1,500 for 30m with workers active on the queue -> BacklogHigh fires and
+  # NotDraining does NOT (active > 0 keeps it quiet).
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="webhooks", state="pending"}'
+        values: '1500x40'
+      - series: 'asynq_tasks_enqueued_total{queue="webhooks", state="active"}'
+        values: '20x40'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueBacklogHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks backlog above 1,000 for 30m"
+              description: "1.5k tasks are pending on the webhooks queue and it has not dipped below 1,000 for 30m. The worker pool is not clearing what producers enqueue. Check whether a task type on this queue got slow (Asynq Queue Health dashboard, Oldest Pending Age) before raising concurrency."
+      - eval_time: 31m
+        alertname: AsynqQueueNotDraining
+        exp_alerts: []
+
+  # A backlog that spikes to 1,500 and drains to 0 every other minute -> BacklogHigh
+  # silent: min_over_time asks for a SUSTAINED backlog, not a peak.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="default", state="pending"}'
+        values: '1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0 1500 0'
+      - series: 'asynq_tasks_enqueued_total{queue="default", state="active"}'
+        values: '20x40'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueBacklogHigh
+        exp_alerts: []
+
+  # A paused queue with a big, old backlog -> BacklogHigh and OldestPendingStale both
+  # stay silent (the pause explains the backlog); QueuePaused is the rule that fires.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="webhooks", state="pending"}'
+        values: '1500x40'
+      - series: 'asynq_queue_latency_seconds{queue="webhooks"}'
+        values: '7200x40'
+      - series: 'asynq_queue_paused_total{queue="webhooks"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueBacklogHigh
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: AsynqOldestPendingStale
+        exp_alerts: []
+
+  # Backlog of 400 (under the 1,000 floor) -> BacklogHigh silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="default", state="pending"}'
+        values: '400x40'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueBacklogHigh
+        exp_alerts: []
+
+  # Oldest pending task 2,000s old for 15m -> OldestPendingStale fires.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_queue_latency_seconds{queue="default"}'
+        values: '2000x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: AsynqOldestPendingStale
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: default
+            exp_annotations:
+              summary: "asynq queue default oldest pending task older than 30m"
+              description: "The oldest pending task on the default queue has waited 33m 20s. Work is arriving faster than this queue drains it; anything scheduled on it is running late by at least that much. Check the queue's throughput and failure rate on the Asynq Queue Health dashboard."
+
+  # Oldest pending task 100s old -> OldestPendingStale silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_queue_latency_seconds{queue="default"}'
+        values: '100x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: AsynqOldestPendingStale
+        exp_alerts: []
+
+  # 1 failure per minute out of 2 processed per minute (50%) over an hour, sustained
+  # 30m, volume 120/h -> FailureRateHigh fires. Two pods report identical counters; every
+  # term is a max-deduped difference, so nothing shifts with pod count.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="webhooks", instance="pod-a"}'
+        values: '0+1x100'
+      - series: 'asynq_tasks_failed_total{queue="webhooks", instance="pod-b"}'
+        values: '0+1x100'
+      - series: 'asynq_tasks_processed_total{queue="webhooks", instance="pod-a"}'
+        values: '0+2x100'
+      - series: 'asynq_tasks_processed_total{queue="webhooks", instance="pod-b"}'
+        values: '0+2x100'
+    alert_rule_test:
+      - eval_time: 95m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks failure rate above 25%"
+              description: "50% of the tasks processed on the webhooks queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+
+  # The same 50% failure shape with one missed scrape mid-window (the collector dropped
+  # every series for that scrape) -> FailureRateHigh still fires at 95m: the counter
+  # selectors are window-wrapped, so the gap does not empty the guard and reset `for:`.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="webhooks"}'
+        values: '0+1x80 _ 82+1x18'
+      - series: 'asynq_tasks_processed_total{queue="webhooks"}'
+        values: '0+2x80 _ 164+2x18'
+    alert_rule_test:
+      - eval_time: 95m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks failure rate above 25%"
+              description: "50% of the tasks processed on the webhooks queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+
+  # 1 failure per 10 processed (10%) -> under the 25% floor, silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="webhooks"}'
+        values: '0+1x100'
+      - series: 'asynq_tasks_processed_total{queue="webhooks"}'
+        values: '0+10x100'
+    alert_rule_test:
+      - eval_time: 95m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts: []
+
+  # 100% failure but only 2 tasks processed in the trailing hour (5 since the series
+  # began) -> under the >= 20 volume guard, silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="emails"}'
+        values: '0x10 1x10 2x10 3x10 4x10 5x44'
+      - series: 'asynq_tasks_processed_total{queue="emails"}'
+        values: '0x10 1x10 2x10 3x10 4x10 5x44'
+    alert_rule_test:
+      - eval_time: 95m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts: []
+
+  # Low-volume queue: 6 failures out of 6 processed in a day -> FailuresLowVolume fires
+  # (the ratio rule cannot see a queue this quiet). 1m samples over 26h: a coarser sample
+  # interval would leave staleness gaps that break the `for: 1h` chain.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="reports"}'
+        values: '0x1499 6x80'
+      - series: 'asynq_tasks_processed_total{queue="reports"}'
+        values: '0x1499 6x80'
+    alert_rule_test:
+      - eval_time: 26h10m
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: reports
+            exp_annotations:
+              summary: "asynq queue reports failure rate above 25% over 24h on a low-volume queue"
+              description: "100% of the tasks processed on the reports queue in the last 24h failed, on a queue too quiet for the hourly failure-rate rule to see. Find the failing task type in the worker logs or the queue's archived tasks, and check its handler."
+
+  # The uncovered band the two rules must not leave: 25 tasks a day (more than 20 in a day),
+  # 20 of them failed -> FailuresLowVolume fires at 80%. The 25 arrive in one minute at 25h,
+  # so the hourly rule fires for the queue from 25h30m until they leave its hour at 25h59m,
+  # and holds FailuresLowVolume off; FailuresLowVolume then fires once its 1h dwell completes.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="exports"}'
+        values: '0x1499 20x140'
+      - series: 'asynq_tasks_processed_total{queue="exports"}'
+        values: '0x1499 25x140'
+    alert_rule_test:
+      - eval_time: 27h10m
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: exports
+            exp_annotations:
+              summary: "asynq queue exports failure rate above 25% over 24h on a low-volume queue"
+              description: "80% of the tasks processed on the exports queue in the last 24h failed, on a queue too quiet for the hourly failure-rate rule to see. Find the failing task type in the worker logs or the queue's archived tasks, and check its handler."
+
+  # 5 failures among 400 processed in a day (1.25%) -> silent: the failure count clears
+  # the >= 5 floor but the share is healthy.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="digests"}'
+        values: '0x1499 5x80'
+      - series: 'asynq_tasks_processed_total{queue="digests"}'
+        values: '0x1499 400x80'
+    alert_rule_test:
+      - eval_time: 26h10m
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts: []
+
+  # Busy queue with 6 failures among 2,880 processed in a day -> FailuresLowVolume silent
+  # (that is the hourly rule's territory: 2,880 is past the 480/day hand-off).
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="webhooks"}'
+        values: '0x1499 6x80'
+      - series: 'asynq_tasks_processed_total{queue="webhooks"}'
+        values: '0+2x1580'
+    alert_rule_test:
+      - eval_time: 26h10m
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts: []
+
+  # Series present, then the collector goes dark -> MetricsAbsent fires 15m after the
+  # last sample (not 30m: there is no extra `for:` on top of the lookback).
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="default", state="pending"}'
+        values: '0x5 _x30'
+    alert_rule_test:
+      - eval_time: 19m
+        alertname: AsynqMetricsAbsent
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: AsynqMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+            exp_annotations:
+              summary: "asynq queue metrics are not being scraped — the queue alerts are blind"
+              description: "No asynq_* series has been scraped in the last 15 minutes, so every Asynq* rule that depends on it evaluates against nothing and cannot fire. Either the process running the collector is not being scraped, or the x/metrics collector is failing on every scrape (it drops all series when one Inspector call to Redis fails). Check that process's /metrics for asynq_ series and its Redis connectivity."
+
+  # No asynq series scraped at all for 15m -> MetricsAbsent fires; the other rules are
+  # blind in this state, which is exactly what this one exists to say.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="worker"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: AsynqMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+            exp_annotations:
+              summary: "asynq queue metrics are not being scraped — the queue alerts are blind"
+              description: "No asynq_* series has been scraped in the last 15 minutes, so every Asynq* rule that depends on it evaluates against nothing and cannot fire. Either the process running the collector is not being scraped, or the x/metrics collector is failing on every scrape (it drops all series when one Inspector call to Redis fails). Check that process's /metrics for asynq_ series and its Redis connectivity."
+
+  # Nothing asynq was ever scraped -> MetricsAbsent fires at once: there is no `for:`, and an
+  # empty window is as blind as a lapsed one.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="worker"}'
+        values: '1x5'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: AsynqMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+            exp_annotations:
+              summary: "asynq queue metrics are not being scraped — the queue alerts are blind"
+              description: "No asynq_* series has been scraped in the last 15 minutes, so every Asynq* rule that depends on it evaluates against nothing and cannot fire. Either the process running the collector is not being scraped, or the x/metrics collector is failing on every scrape (it drops all series when one Inspector call to Redis fails). Check that process's /metrics for asynq_ series and its Redis connectivity."
+
+  # Series present -> MetricsAbsent silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="default", state="pending"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: AsynqMetricsAbsent
+        exp_alerts: []
+
+  # ── Two services, each with asynq's stock "default" queue, kept apart by job ──────────
+
+  # billing's default queue has 50 pending and nothing active; mailer's default queue is
+  # empty and idle -> NotDraining fires for billing alone.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{job="billing", queue="default", state="pending"}'
+        values: '50x50'
+      - series: 'asynq_tasks_enqueued_total{job="billing", queue="default", state="active"}'
+        values: '0x50'
+      - series: 'asynq_tasks_enqueued_total{job="mailer", queue="default", state="pending"}'
+        values: '0x50'
+      - series: 'asynq_tasks_enqueued_total{job="mailer", queue="default", state="active"}'
+        values: '0x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: AsynqQueueNotDraining
+        exp_alerts:
+          - exp_labels:
+              severity: p1
+              team: platform
+              job: billing
+              queue: default
+            exp_annotations:
+              summary: "asynq queue default has a backlog and nothing is processing it"
+              description: "50 tasks have sat pending on the default queue for 30m with zero active workers on it and the queue is not paused. Possible causes: the worker pool is saturated and this low-priority queue keeps losing the draw (other queues show active > 0 — check the server's Concurrency and Queues priorities); no running server lists this queue in its Config.Queues (a retired queue's leftovers stay in Redis until deleted with Inspector.DeleteQueue); or the worker process is down. Start on the Asynq Queue Health dashboard, Backlog by State."
+
+  # billing's default queue holds 5,000; mailer's default queue is paused -> BacklogHigh fires
+  # for billing: the pause on another service does not excuse it.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{job="billing", queue="default", state="pending"}'
+        values: '5000x50'
+      - series: 'asynq_tasks_enqueued_total{job="mailer", queue="default", state="pending"}'
+        values: '0x50'
+      - series: 'asynq_queue_paused_total{job="mailer", queue="default"}'
+        values: '1x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: AsynqQueueBacklogHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: billing
+              queue: default
+            exp_annotations:
+              summary: "asynq queue default backlog above 1,000 for 30m"
+              description: "5k tasks are pending on the default queue and it has not dipped below 1,000 for 30m. The worker pool is not clearing what producers enqueue. Check whether a task type on this queue got slow (Asynq Queue Health dashboard, Oldest Pending Age) before raising concurrency."
+
+  # mailer's collector goes dark at 20m while billing keeps reporting -> MetricsAbsent fires
+  # for mailer once it has been silent for 15m.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{job="billing", queue="default", state="pending"}'
+        values: '0x50'
+      - series: 'asynq_tasks_enqueued_total{job="mailer", queue="default", state="pending"}'
+        values: '0x20 _x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: AsynqMetricsAbsent
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: AsynqMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: mailer
+            exp_annotations:
+              summary: "asynq queue metrics are not being scraped — the queue alerts are blind"
+              description: "No asynq_* series has been scraped in the last 15 minutes for job mailer, so every Asynq* rule that depends on it evaluates against nothing and cannot fire. Either the process running the collector is not being scraped, or the x/metrics collector is failing on every scrape (it drops all series when one Inspector call to Redis fails). Check that process's /metrics for asynq_ series and its Redis connectivity."
+
+  # ── Counters compared inside the window ──────────────────────────────────────────────
+
+  # A new queue whose every task fails, 10 a minute from 0m -> FailureRateHigh fires at 60m:
+  # the in-window difference needs no sample from before the series began.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{job="worker", queue="reports"}'
+        values: '0+10x120'
+      - series: 'asynq_tasks_processed_total{job="worker", queue="reports"}'
+        values: '0+10x120'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: worker
+              queue: reports
+            exp_annotations:
+              summary: "asynq queue reports failure rate above 25%"
+              description: "100% of the tasks processed on the reports queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+
+  # Half the tasks fail, but both counters went back to 0 at 71m (a Redis key loss) -> silent
+  # while the reset is inside the hour.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{job="worker", queue="reports"}'
+        values: '0+5x70 0+5x50'
+      - series: 'asynq_tasks_processed_total{job="worker", queue="reports"}'
+        values: '0+10x70 0+10x50'
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts: []
+
+  # ── A pause that ended ──────────────────────────────────────────────────────────────
+
+  # Paused for 26 minutes, then unpaused -> QueuePaused silent at 30m.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_queue_paused_total{queue="default"}'
+        values: '1x26 0x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: AsynqQueuePaused
+        exp_alerts: []
+
+  # ── Thresholds and dwell times ──────────────────────────────────────────────────────
+
+  # Pending with nothing active from 0m: one minute before the 30m dwell completes -> silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="emails", state="pending"}'
+        values: '5x40'
+      - series: 'asynq_tasks_enqueued_total{queue="emails", state="active"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 29m
+        alertname: AsynqQueueNotDraining
+        exp_alerts: []
+
+  # Paused from 0m: one minute before the 30m dwell completes -> silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_queue_paused_total{queue="default"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 29m
+        alertname: AsynqQueuePaused
+        exp_alerts: []
+
+  # A backlog of exactly 1,000 -> silent (the rule says above 1,000). 1,500 from 0m, one
+  # minute before the 30m dwell completes -> silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{queue="default", state="pending"}'
+        values: '1000x40'
+      - series: 'asynq_tasks_enqueued_total{queue="webhooks", state="pending"}'
+        values: '1500x40'
+    alert_rule_test:
+      - eval_time: 29m
+        alertname: AsynqQueueBacklogHigh
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: AsynqQueueBacklogHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks backlog above 1,000 for 30m"
+              description: "1.5k tasks are pending on the webhooks queue and it has not dipped below 1,000 for 30m. The worker pool is not clearing what producers enqueue. Check whether a task type on this queue got slow (Asynq Queue Health dashboard, Oldest Pending Age) before raising concurrency."
+
+  # Oldest pending exactly 1,800s -> silent (the rule says older than 30m). 2,000s from 0m,
+  # one minute before the 15m dwell completes -> silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_queue_latency_seconds{queue="default"}'
+        values: '1800x20'
+      - series: 'asynq_queue_latency_seconds{queue="webhooks"}'
+        values: '2000x20'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: AsynqOldestPendingStale
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: AsynqOldestPendingStale
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks oldest pending task older than 30m"
+              description: "The oldest pending task on the webhooks queue has waited 33m 20s. Work is arriving faster than this queue drains it; anything scheduled on it is running late by at least that much. Check the queue's throughput and failure rate on the Asynq Queue Health dashboard."
+
+  # Exactly 25% failing -> silent (the rule says above 25%). 19 tasks an hour all failing ->
+  # silent (under the 20 floor). 30% failing at 10 a minute -> fires.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="default"}'
+        values: '0+1x120'
+      - series: 'asynq_tasks_processed_total{queue="default"}'
+        values: '0+4x120'
+      - series: 'asynq_tasks_failed_total{queue="low"}'
+        values: '0+0.3x120'
+      - series: 'asynq_tasks_processed_total{queue="low"}'
+        values: '0+0.3x120'
+      - series: 'asynq_tasks_failed_total{queue="webhooks"}'
+        values: '0+3x120'
+      - series: 'asynq_tasks_processed_total{queue="webhooks"}'
+        values: '0+10x120'
+    alert_rule_test:
+      - eval_time: 95m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks failure rate above 25%"
+              description: "30% of the tasks processed on the webhooks queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+
+  # Half failing from 0m: true from 2m, so one minute before the 30m dwell completes it is
+  # silent, and at 33m it fires.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="webhooks"}'
+        values: '0+5x60'
+      - series: 'asynq_tasks_processed_total{queue="webhooks"}'
+        values: '0+10x60'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts: []
+
+  # Low-volume bounds: 4 failed of 4 in a day -> silent (needs 5 failures); 130 failed of 500
+  # -> silent (500 is the hourly rule's territory); 120 failed of 470 -> fires. Each day's
+  # tasks arrive in one minute at 25h, so the hourly rule fires for exports and digests from
+  # 25h30m to 25h58m and holds FailuresLowVolume off; its 1h dwell then completes at 26h59m.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="reports"}'
+        values: '0x1499 4x140'
+      - series: 'asynq_tasks_processed_total{queue="reports"}'
+        values: '0x1499 4x140'
+      - series: 'asynq_tasks_failed_total{queue="exports"}'
+        values: '0x1499 130x140'
+      - series: 'asynq_tasks_processed_total{queue="exports"}'
+        values: '0x1499 500x140'
+      - series: 'asynq_tasks_failed_total{queue="digests"}'
+        values: '0x1499 120x140'
+      - series: 'asynq_tasks_processed_total{queue="digests"}'
+        values: '0x1499 470x140'
+    alert_rule_test:
+      - eval_time: 26h58m
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts: []
+      - eval_time: 27h10m
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: digests
+            exp_annotations:
+              summary: "asynq queue digests failure rate above 25% over 24h on a low-volume queue"
+              description: "25.53% of the tasks processed on the digests queue in the last 24h failed, on a queue too quiet for the hourly failure-rate rule to see. Find the failing task type in the worker logs or the queue's archived tasks, and check its handler."
+
+  # Known limitation, pinned: a job that has reported nothing for over a day drops out of
+  # MetricsAbsent's first branch, as a retired job would, while another job still reports.
+  - interval: 10m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{job="billing", queue="default", state="pending"}'
+        values: '0x200'
+      - series: 'asynq_tasks_enqueued_total{job="mailer", queue="default", state="pending"}'
+        values: '0x2 _x198'
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: AsynqMetricsAbsent
+        exp_alerts: []
+
+
+  # ── Pass-2 additions: limits, floors, resets and two jobs ───────────────────────────
+  # Known limitation, pinned: mailer was retired at 1h while billing keeps reporting ->
+  # MetricsAbsent keeps firing for mailer until a day has passed since its last series.
+  - interval: 5m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{job="billing", queue="default", state="pending"}'
+        values: '0x300'
+      - series: 'asynq_tasks_enqueued_total{job="mailer", queue="default", state="pending"}'
+        values: '0x12 _x288'
+    alert_rule_test:
+      - eval_time: 24h
+        alertname: AsynqMetricsAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: mailer
+            exp_annotations:
+              summary: "asynq queue metrics are not being scraped — the queue alerts are blind"
+              description: "No asynq_* series has been scraped in the last 15 minutes for job mailer, so every Asynq* rule that depends on it evaluates against nothing and cannot fire. Either the process running the collector is not being scraped, or the x/metrics collector is failing on every scrape (it drops all series when one Inspector call to Redis fails). Check that process's /metrics for asynq_ series and its Redis connectivity."
+
+  # Half the tasks failing from 0m: silent at 31m, firing at 33m.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="webhooks"}'
+        values: '0+5x60'
+      - series: 'asynq_tasks_processed_total{queue="webhooks"}'
+        values: '0+10x60'
+    alert_rule_test:
+      - eval_time: 33m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks failure rate above 25%"
+              description: "50% of the tasks processed on the webhooks queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+
+  # 20 tasks processed at 50m, every one failing -> fires at 90m: 20 is the hourly floor.
+  # 19 tasks -> silent.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="emails"}'
+        values: '0x50 20x80'
+      - series: 'asynq_tasks_processed_total{queue="emails"}'
+        values: '0x50 20x80'
+      - series: 'asynq_tasks_failed_total{queue="reports"}'
+        values: '0x50 19x80'
+      - series: 'asynq_tasks_processed_total{queue="reports"}'
+        values: '0x50 19x80'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: emails
+            exp_annotations:
+              summary: "asynq queue emails failure rate above 25%"
+              description: "100% of the tasks processed on the emails queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+
+  # Three replicas each report the same 7 tasks, all failing -> silent: the volume is deduped
+  # across replicas, so 7, not 21.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="low", instance="pod-a"}'
+        values: '0x50 7x80'
+      - series: 'asynq_tasks_processed_total{queue="low", instance="pod-a"}'
+        values: '0x50 7x80'
+      - series: 'asynq_tasks_failed_total{queue="low", instance="pod-b"}'
+        values: '0x50 7x80'
+      - series: 'asynq_tasks_processed_total{queue="low", instance="pod-b"}'
+        values: '0x50 7x80'
+      - series: 'asynq_tasks_failed_total{queue="low", instance="pod-c"}'
+        values: '0x50 7x80'
+      - series: 'asynq_tasks_processed_total{queue="low", instance="pod-c"}'
+        values: '0x50 7x80'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts: []
+
+  # Only the failed counter resets (from 1,000 to 0 at 61m) while processed climbs -> silent
+  # at 100m: the reset is inside the hour.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="default"}'
+        values: '1000+1x60 0+1x60'
+      - series: 'asynq_tasks_processed_total{queue="default"}'
+        values: '5000+10x120'
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts: []
+
+  # 27% failing at 100 a minute -> fires: between the 25% threshold and 30%.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="webhooks"}'
+        values: '0+27x120'
+      - series: 'asynq_tasks_processed_total{queue="webhooks"}'
+        values: '0+100x120'
+    alert_rule_test:
+      - eval_time: 95m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks failure rate above 25%"
+              description: "27% of the tasks processed on the webhooks queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+
+  # Low-volume reset: 6 of 6 failing in the day, but the counters went back to 0 at 26h ->
+  # silent while the reset is inside the day.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="reports"}'
+        values: '0x1499 6x60 0x30'
+      - series: 'asynq_tasks_processed_total{queue="reports"}'
+        values: '0x1499 6x60 0x30'
+    alert_rule_test:
+      - eval_time: 26h20m
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts: []
+
+  # The daily edge: 130 failed of 480 processed -> silent (480 is the hourly rule's), 130 of
+  # 479 -> fires. As above, evaluated once the one-minute burst at 25h has left the hour.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{queue="exports"}'
+        values: '0x1499 130x140'
+      - series: 'asynq_tasks_processed_total{queue="exports"}'
+        values: '0x1499 480x140'
+      - series: 'asynq_tasks_failed_total{queue="digests"}'
+        values: '0x1499 130x140'
+      - series: 'asynq_tasks_processed_total{queue="digests"}'
+        values: '0x1499 479x140'
+    alert_rule_test:
+      - eval_time: 27h10m
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              queue: digests
+            exp_annotations:
+              summary: "asynq queue digests failure rate above 25% over 24h on a low-volume queue"
+              description: "27.14% of the tasks processed on the digests queue in the last 24h failed, on a queue too quiet for the hourly failure-rate rule to see. Find the failing task type in the worker logs or the queue's archived tasks, and check its handler."
+
+  # Two jobs with a "default" queue: billing fails half its tasks, mailer none ->
+  # FailureRateHigh fires for billing alone.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{job="billing", queue="default"}'
+        values: '0+5x120'
+      - series: 'asynq_tasks_processed_total{job="billing", queue="default"}'
+        values: '0+10x120'
+      - series: 'asynq_tasks_failed_total{job="mailer", queue="default"}'
+        values: '0x120'
+      - series: 'asynq_tasks_processed_total{job="mailer", queue="default"}'
+        values: '0+10x120'
+    alert_rule_test:
+      - eval_time: 95m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: billing
+              queue: default
+            exp_annotations:
+              summary: "asynq queue default failure rate above 25%"
+              description: "50% of the tasks processed on the default queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+
+  # Two jobs with a "default" queue: billing's oldest task waits 2,000s, mailer's queue is
+  # empty -> OldestPendingStale fires for billing alone.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_queue_latency_seconds{job="billing", queue="default"}'
+        values: '2000x20'
+      - series: 'asynq_queue_latency_seconds{job="mailer", queue="default"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: AsynqOldestPendingStale
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: billing
+              queue: default
+            exp_annotations:
+              summary: "asynq queue default oldest pending task older than 30m"
+              description: "The oldest pending task on the default queue has waited 33m 20s. Work is arriving faster than this queue drains it; anything scheduled on it is running late by at least that much. Check the queue's throughput and failure rate on the Asynq Queue Health dashboard."
+
+  # Two jobs with a "default" queue: billing's is paused, mailer's is not -> QueuePaused fires
+  # for billing alone.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_queue_paused_total{job="billing", queue="default"}'
+        values: '1x40'
+      - series: 'asynq_queue_paused_total{job="mailer", queue="default"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: AsynqQueuePaused
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: billing
+              queue: default
+            exp_annotations:
+              summary: "asynq queue default has been paused for over 30m"
+              description: "The default queue is paused, so nothing pulls from it and its backlog only grows. Pausing is a manual Inspector.PauseQueue call and is not undone by a deploy. Unpause it (Inspector.UnpauseQueue) once the incident that motivated it is over."
+
+  # ── A job that stopped reporting ────────────────────────────────────────────────────
+  # The failure-rate rules leave a job with no processed sample in the last 5m to
+  # AsynqMetricsAbsent, instead of reporting the frozen share their [1h] and [24h] windows
+  # still hold.
+  - interval: 1m
+    # job "gone" reports for 10 minutes (100 processed, 50 failed), then disappears entirely.
+    input_series:
+      - series: 'asynq_tasks_processed_total{job="gone", queue="q"}'
+        values: '0+10x10'
+      - series: 'asynq_tasks_failed_total{job="gone", queue="q"}'
+        values: '0+5x10'
+      - series: 'asynq_tasks_enqueued_total{job="gone", queue="q", state="pending"}'
+        values: '0x10'
+    alert_rule_test:
+      - {eval_time: 45m, alertname: AsynqQueueFailureRateHigh, exp_alerts: []}
+      - {eval_time: 2h, alertname: AsynqQueueFailuresLowVolume, exp_alerts: []}
+      - {eval_time: 23h, alertname: AsynqQueueFailuresLowVolume, exp_alerts: []}
+
+  # ── FailuresLowVolume holds off while FailureRateHigh fires for the queue ────────────
+  - interval: 1m
+    # A steady queue: 25 processed/h (1 every 2.4m, rounded here to 1 per 2m = 30/h), half failing,
+    # in a Prometheus that started scraping it at t=0. The hourly rule owns it (>= 20/h); the daily
+    # low-volume rule is meant for queues under 480/day, which this one is not at steady state.
+    input_series:
+      - {series: 'asynq_tasks_processed_total{job="w", queue="q"}', values: '0+0.5x300'}
+      - {series: 'asynq_tasks_failed_total{job="w", queue="q"}', values: '0+0.25x300'}
+    alert_rule_test:
+      - eval_time: 1h20m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: q
+            exp_annotations:
+              summary: "asynq queue q failure rate above 25%"
+              description: "50% of the tasks processed on the q queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+      - {eval_time: 4h, alertname: AsynqQueueFailuresLowVolume, exp_alerts: []}
+
+  # A busy queue, 60 tasks an hour, half failing, scraped from 0m -> FailureRateHigh fires and
+  # FailuresLowVolume never does, not even in the first 8h, before the day's window holds 480.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_processed_total{job="w", queue="busy"}'
+        values: '0+1x1600'
+      - series: 'asynq_tasks_failed_total{job="w", queue="busy"}'
+        values: '0+0.5x1600'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: busy
+            exp_annotations:
+              summary: "asynq queue busy failure rate above 25%"
+              description: "50% of the tasks processed on the busy queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+      - {eval_time: 2h, alertname: AsynqQueueFailuresLowVolume, exp_alerts: []}
+      - {eval_time: 4h, alertname: AsynqQueueFailuresLowVolume, exp_alerts: []}
+      - {eval_time: 12h, alertname: AsynqQueueFailuresLowVolume, exp_alerts: []}
+      - {eval_time: 26h, alertname: AsynqQueueFailuresLowVolume, exp_alerts: []}
+
+  # A genuinely quiet queue: 10 tasks in the day, one every 2h, and every other one failing,
+  # so 5 of 10 failed by 20h -> FailuresLowVolume fires an hour later, at 50%. It never
+  # processed 20 in an hour, so the hourly rule never sees it.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_processed_total{job="w", queue="quiet"}'
+        values: '0x119 1x119 2x119 3x119 4x119 5x119 6x119 7x119 8x119 9x119 10x200'
+      - series: 'asynq_tasks_failed_total{job="w", queue="quiet"}'
+        values: '0x239 1x239 2x239 3x239 4x239 5x200'
+    alert_rule_test:
+      - {eval_time: 21h10m, alertname: AsynqQueueFailureRateHigh, exp_alerts: []}
+      - eval_time: 21h10m
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: quiet
+            exp_annotations:
+              summary: "asynq queue quiet failure rate above 25% over 24h on a low-volume queue"
+              description: "50% of the tasks processed on the quiet queue in the last 24h failed, on a queue too quiet for the hourly failure-rate rule to see. Find the failing task type in the worker logs or the queue's archived tasks, and check its handler."
+
+  # ── Documented trade-off: one collector job per Redis ───────────────────────────────
+  # The README's "When two jobs export the same Redis" pins this: grouping by job keeps two
+  # services that both use a queue named default apart, so two jobs exporting one Redis are
+  # counted twice. The Pending Backlog sum reads 3000 where asynq holds 1500, and every alert
+  # fires once per job.
+  - interval: 1m
+    # api and worker both register the x/metrics collector against one Redis, so both export
+    # the same 1500-task orphan queue.
+    input_series:
+      - {series: 'asynq_tasks_enqueued_total{job="api", queue="orphan", state="pending"}', values: '1500x60'}
+      - {series: 'asynq_tasks_enqueued_total{job="api", queue="orphan", state="active"}', values: '0x60'}
+      - {series: 'asynq_queue_paused_total{job="api", queue="orphan"}', values: '0x60'}
+      - {series: 'asynq_tasks_enqueued_total{job="worker", queue="orphan", state="pending"}', values: '1500x60'}
+      - {series: 'asynq_tasks_enqueued_total{job="worker", queue="orphan", state="active"}', values: '0x60'}
+      - {series: 'asynq_queue_paused_total{job="worker", queue="orphan"}', values: '0x60'}
+    promql_expr_test:
+      - expr: 'sum(max(asynq_tasks_enqueued_total{job=~".+", queue=~".+", state="pending"}) by (job, queue))'
+        eval_time: 40m
+        exp_samples: [{labels: '{}', value: 3000}]
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: AsynqQueueBacklogHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: api
+              queue: orphan
+            exp_annotations:
+              summary: "asynq queue orphan backlog above 1,000 for 30m"
+              description: "1.5k tasks are pending on the orphan queue and it has not dipped below 1,000 for 30m. The worker pool is not clearing what producers enqueue. Check whether a task type on this queue got slow (Asynq Queue Health dashboard, Oldest Pending Age) before raising concurrency."
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: worker
+              queue: orphan
+            exp_annotations:
+              summary: "asynq queue orphan backlog above 1,000 for 30m"
+              description: "1.5k tasks are pending on the orphan queue and it has not dipped below 1,000 for 30m. The worker pool is not clearing what producers enqueue. Check whether a task type on this queue got slow (Asynq Queue Health dashboard, Oldest Pending Age) before raising concurrency."
+
+  # 10 tasks every 40m, every one failing. The hourly volume reaches 20 only while two batches
+  # share the hour, under 20 minutes at a time, so FailureRateHigh never fires and never holds
+  # FailuresLowVolume off -> FailuresLowVolume fires.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_processed_total{job="w", queue="batches"}'
+        values: '0x39 10x39 20x39 30x39 40x39 50x39 60x39 70x39 80x39 90x39'
+      - series: 'asynq_tasks_failed_total{job="w", queue="batches"}'
+        values: '0x39 10x39 20x39 30x39 40x39 50x39 60x39 70x39 80x39 90x39'
+    alert_rule_test:
+      - {eval_time: 3h, alertname: AsynqQueueFailureRateHigh, exp_alerts: []}
+      - eval_time: 3h
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: batches
+            exp_annotations:
+              summary: "asynq queue batches failure rate above 25% over 24h on a low-volume queue"
+              description: "100% of the tasks processed on the batches queue in the last 24h failed, on a queue too quiet for the hourly failure-rate rule to see. Find the failing task type in the worker logs or the queue's archived tasks, and check its handler."
+      - eval_time: 6h
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: batches
+            exp_annotations:
+              summary: "asynq queue batches failure rate above 25% over 24h on a low-volume queue"
+              description: "100% of the tasks processed on the batches queue in the last 24h failed, on a queue too quiet for the hourly failure-rate rule to see. Find the failing task type in the worker logs or the queue's archived tasks, and check its handler."
+
+  # One task every 3m, every one failing: the hourly volume flips between 19 and 20, so
+  # FailureRateHigh never holds for 30m -> FailuresLowVolume fires.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_processed_total{job="w", queue="trickle"}'
+        values: '0x2 1x2 2x2 3x2 4x2 5x2 6x2 7x2 8x2 9x2 10x2 11x2 12x2 13x2 14x2 15x2 16x2 17x2 18x2 19x2 20x2 21x2 22x2 23x2 24x2 25x2 26x2 27x2 28x2 29x2 30x2 31x2 32x2 33x2 34x2 35x2 36x2 37x2 38x2 39x2 40x2 41x2 42x2 43x2 44x2 45x2 46x2 47x2 48x2 49x2 50x2 51x2 52x2 53x2 54x2 55x2 56x2 57x2 58x2 59x2 60x2 61x2 62x2 63x2 64x2 65x2 66x2 67x2 68x2 69x2 70x2 71x2'
+      - series: 'asynq_tasks_failed_total{job="w", queue="trickle"}'
+        values: '0x2 1x2 2x2 3x2 4x2 5x2 6x2 7x2 8x2 9x2 10x2 11x2 12x2 13x2 14x2 15x2 16x2 17x2 18x2 19x2 20x2 21x2 22x2 23x2 24x2 25x2 26x2 27x2 28x2 29x2 30x2 31x2 32x2 33x2 34x2 35x2 36x2 37x2 38x2 39x2 40x2 41x2 42x2 43x2 44x2 45x2 46x2 47x2 48x2 49x2 50x2 51x2 52x2 53x2 54x2 55x2 56x2 57x2 58x2 59x2 60x2 61x2 62x2 63x2 64x2 65x2 66x2 67x2 68x2 69x2 70x2 71x2'
+    alert_rule_test:
+      - {eval_time: 3h, alertname: AsynqQueueFailureRateHigh, exp_alerts: []}
+      - eval_time: 3h
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: trickle
+            exp_annotations:
+              summary: "asynq queue trickle failure rate above 25% over 24h on a low-volume queue"
+              description: "100% of the tasks processed on the trickle queue in the last 24h failed, on a queue too quiet for the hourly failure-rate rule to see. Find the failing task type in the worker logs or the queue's archived tasks, and check its handler."
+
+  # 20 tasks at 50m, every one failing: FailureRateHigh fires from 1h21m to 1h49m, and
+  # FailuresLowVolume, pending since 51m, is held off while it fires. Its 1h dwell restarts at
+  # 1h50m, once the hourly alert resolves, so it is silent at 1h55m and fires at 2h55m.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{job="w", queue="emails"}'
+        values: '0x50 20x150'
+      - series: 'asynq_tasks_processed_total{job="w", queue="emails"}'
+        values: '0x50 20x150'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: emails
+            exp_annotations:
+              summary: "asynq queue emails failure rate above 25%"
+              description: "100% of the tasks processed on the emails queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+      - {eval_time: 90m, alertname: AsynqQueueFailuresLowVolume, exp_alerts: []}
+      - {eval_time: 1h55m, alertname: AsynqQueueFailuresLowVolume, exp_alerts: []}
+      - eval_time: 2h55m
+        alertname: AsynqQueueFailuresLowVolume
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: emails
+            exp_annotations:
+              summary: "asynq queue emails failure rate above 25% over 24h on a low-volume queue"
+              description: "100% of the tasks processed on the emails queue in the last 24h failed, on a queue too quiet for the hourly failure-rate rule to see. Find the failing task type in the worker logs or the queue's archived tasks, and check its handler."
+
+  # A burst of 600 at 10m, a third failing, then 12 tasks an hour, every one failing. At 3h the
+  # hour holds under 20 and the day over 480, so neither failure-rate rule judges the queue.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_processed_total{job="w", queue="nightly"}'
+        values: '0x9 600x60 600+0.2x120'
+      - series: 'asynq_tasks_failed_total{job="w", queue="nightly"}'
+        values: '0x9 200x60 200+0.2x120'
+    alert_rule_test:
+      - {eval_time: 3h, alertname: AsynqQueueFailureRateHigh, exp_alerts: []}
+      - {eval_time: 3h, alertname: AsynqQueueFailuresLowVolume, exp_alerts: []}
+
+  # ── A missed scrape ─────────────────────────────────────────────────────────────────
+  # Half failing from 0m with one failed scrape at 20m (a staleness marker): the 5m gate and
+  # the [1h] windows look past it -> FailureRateHigh fires at 33m, as without the marker.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{job="w", queue="webhooks"}'
+        values: '0+5x19 stale 105+5x40'
+      - series: 'asynq_tasks_processed_total{job="w", queue="webhooks"}'
+        values: '0+10x19 stale 210+10x40'
+    alert_rule_test:
+      - eval_time: 33m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks failure rate above 25%"
+              description: "50% of the tasks processed on the webhooks queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+
+  # Firing at 60m, then the job stops (a staleness marker at 61m): the 5m gate keeps it firing
+  # at 64m and drops it at 65m, when no processed sample is left in the last 5m.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_failed_total{job="w", queue="webhooks"}'
+        values: '0+5x60 stale'
+      - series: 'asynq_tasks_processed_total{job="w", queue="webhooks"}'
+        values: '0+10x60 stale'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks failure rate above 25%"
+              description: "50% of the tasks processed on the webhooks queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+      - eval_time: 64m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks failure rate above 25%"
+              description: "50% of the tasks processed on the webhooks queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+      - {eval_time: 65m, alertname: AsynqQueueFailureRateHigh, exp_alerts: []}
+
+  # The same half-failing queue scraped every 2m: 20 processed by 4m, so FailureRateHigh fires
+  # at 34m; the 5m gate always holds a sample.
+  - interval: 2m
+    input_series:
+      - series: 'asynq_tasks_failed_total{job="w", queue="webhooks"}'
+        values: '0+5x30'
+      - series: 'asynq_tasks_processed_total{job="w", queue="webhooks"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - {eval_time: 33m, alertname: AsynqQueueFailureRateHigh, exp_alerts: []}
+      - eval_time: 34m
+        alertname: AsynqQueueFailureRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p2
+              team: platform
+              job: w
+              queue: webhooks
+            exp_annotations:
+              summary: "asynq queue webhooks failure rate above 25%"
+              description: "50% of the tasks processed on the webhooks queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+
+  # ── A queue whose processed counter rises is draining ───────────────────────────────
+  # A healthy, fast queue: 2 tasks/s, each 20ms. Every scrape catches 1-3 tasks pending while the
+  # processor waits out its idle poll, and almost never one active. It processes 120 tasks a minute.
+  - interval: 1m
+    input_series:
+      - {series: 'asynq_tasks_enqueued_total{job="svc", queue="default", state="pending"}', values: '1 2 1 3 1 2 1x40'}
+      - {series: 'asynq_tasks_enqueued_total{job="svc", queue="default", state="active"}', values: '0x46'}
+      - {series: 'asynq_queue_paused_total{job="svc", queue="default"}', values: '0x46'}
+      - {series: 'asynq_tasks_processed_total{job="svc", queue="default"}', values: '0+120x46'}
+    alert_rule_test:
+      - {eval_time: 40m, alertname: AsynqQueueNotDraining, exp_alerts: []}
+
+  # A stuck queue whose processed counter stays flat at 100 -> NotDraining fires: a counter that
+  # exists but does not rise is no sign of draining.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{job="svc", queue="stuck", state="pending"}'
+        values: '5x40'
+      - series: 'asynq_tasks_enqueued_total{job="svc", queue="stuck", state="active"}'
+        values: '0x40'
+      - series: 'asynq_queue_paused_total{job="svc", queue="stuck"}'
+        values: '0x40'
+      - series: 'asynq_tasks_processed_total{job="svc", queue="stuck"}'
+        values: '100x40'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueNotDraining
+        exp_alerts:
+          - exp_labels:
+              severity: p1
+              team: platform
+              job: svc
+              queue: stuck
+            exp_annotations:
+              summary: "asynq queue stuck has a backlog and nothing is processing it"
+              description: "5 tasks have sat pending on the stuck queue for 30m with zero active workers on it and the queue is not paused. Possible causes: the worker pool is saturated and this low-priority queue keeps losing the draw (other queues show active > 0 — check the server's Concurrency and Queues priorities); no running server lists this queue in its Config.Queues (a retired queue's leftovers stay in Redis until deleted with Inspector.DeleteQueue); or the worker process is down. Start on the Asynq Queue Health dashboard, Backlog by State."
+
+  # A stuck queue with no processed series at all, beside a queue of the same job whose counter
+  # rises -> NotDraining fires for the stuck one: the processed clause is matched per queue, and
+  # a queue without the series is judged on pending and active alone.
+  - interval: 1m
+    input_series:
+      - series: 'asynq_tasks_enqueued_total{job="svc", queue="orphan", state="pending"}'
+        values: '5x40'
+      - series: 'asynq_tasks_enqueued_total{job="svc", queue="orphan", state="active"}'
+        values: '0x40'
+      - series: 'asynq_tasks_enqueued_total{job="svc", queue="default", state="pending"}'
+        values: '0x40'
+      - series: 'asynq_tasks_enqueued_total{job="svc", queue="default", state="active"}'
+        values: '0x40'
+      - series: 'asynq_tasks_processed_total{job="svc", queue="default"}'
+        values: '0+120x40'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: AsynqQueueNotDraining
+        exp_alerts:
+          - exp_labels:
+              severity: p1
+              team: platform
+              job: svc
+              queue: orphan
+            exp_annotations:
+              summary: "asynq queue orphan has a backlog and nothing is processing it"
+              description: "5 tasks have sat pending on the orphan queue for 30m with zero active workers on it and the queue is not paused. Possible causes: the worker pool is saturated and this low-priority queue keeps losing the draw (other queues show active > 0 — check the server's Concurrency and Queues priorities); no running server lists this queue in its Config.Queues (a retired queue's leftovers stay in Redis until deleted with Inspector.DeleteQueue); or the worker process is down. Start on the Asynq Queue Health dashboard, Backlog by State."

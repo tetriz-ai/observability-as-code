@@ -1,0 +1,37 @@
+# Copyright 2026 Workloom Solutions Private Limited
+# SPDX-License-Identifier: MIT
+
+rule_files:
+  - ../.extracted/rules-payments.yaml
+evaluation_interval: 1m
+tests:
+  # Both targets down from 2m -> fires once it has held for 5m.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="payments", instance="192.0.2.21:8080"}'
+        values: '1 1 0x20'
+      - series: 'up{job="payments", instance="192.0.2.22:8080"}'
+        values: '1 1 0x20'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: PaymentsDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              owner: payments
+              job: payments
+            exp_annotations:
+              summary: "Every payments target is down"
+              description: "No payments target has answered a scrape for 5m."
+
+  # One of the two targets still up -> silent.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="payments", instance="192.0.2.21:8080"}'
+        values: '1 1 0x20'
+      - series: 'up{job="payments", instance="192.0.2.22:8080"}'
+        values: '1x22'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: PaymentsDown
+        exp_alerts: []

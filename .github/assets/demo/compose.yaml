@@ -1,0 +1,10 @@
+# Local-only synthetic data for the README screenshot. Use with the root compose file.
+services:
+  readme-metrics:
+    image: python:3.12-alpine
+    command: ['python', '/demo/metrics.py']
+    volumes:
+      - ./.github/assets/demo/metrics.py:/demo/metrics.py:ro
+  prometheus:
+    volumes:
+      - ./.github/assets/demo/prometheus.yml:/etc/prometheus/prometheus.yml:ro

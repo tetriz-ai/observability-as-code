@@ -1,0 +1,152 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: platform-rules
+  namespace: monitoring
+  labels:
+    role: alert-rules
+spec:
+  groups:
+    - name: platform.rules
+      rules:
+        # ── Pod health (Kubernetes) ───────────────────────────────────────
+        # kube-state-metrics series, judged per container. To scope a rule to one
+        # workload, add a matcher such as container="api" or namespace="shop" to every
+        # selector in its expression.
+        # floor(): increase() extrapolates to the window's edges when the first sample in it is
+        # not zero, so exactly 3 restarts can read as 3.1.
+        - alert: PodRestartLoop
+          expr: |
+            floor(increase(kube_pod_container_status_restarts_total[30m])) > 3
+          for: 5m
+          labels:
+            severity: "p0"
+            team: "platform"
+          annotations:
+            summary: "Pod {{ $labels.pod }} restarting frequently"
+            description: "{{ $labels.container }} on {{ $labels.pod }} restarted {{ $value | humanize }} times in the last 30 minutes."
+
+        # last_terminated_reason keeps reading OOMKilled until the container terminates
+        # again for another reason, so on its own it would page for the life of the pod.
+        # Paired with a restart in the last 10m, the alert fires on the OOM restart and
+        # resolves once that restart ages out of the window.
+        - alert: PodOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1
+            and on (namespace, pod, container)
+            increase(kube_pod_container_status_restarts_total[10m]) > 0
+          for: 1m
+          labels:
+            severity: "p0"
+            team: "platform"
+          annotations:
+            summary: "Pod {{ $labels.pod }} OOM killed"
+            description: "Container {{ $labels.container }} on {{ $labels.pod }} was terminated due to OOM. Bump memory request/limit or find the leak."
+
+        # The container's working set (cAdvisor, scraped from the kubelet: every process
+        # in the container's cgroup, page cache it cannot reclaim included) against its
+        # memory limit. container="" is the pod's own cgroup and "POD" the pause container;
+        # neither has a limit of its own. The join is on namespace, pod and container so a
+        # pod with sidecars matches one limit per container. Both sides take max by those
+        # labels first: the kubelet scraped by two jobs, or two kube-state-metrics
+        # replicas, would otherwise give one side two series and make the whole rule fail
+        # to evaluate.
+        - alert: HighMemory
+          expr: |
+            max by (namespace, pod, container) (container_memory_working_set_bytes{container!="", container!="POD"})
+            / on (namespace, pod, container)
+            max by (namespace, pod, container) (kube_pod_container_resource_limits{resource="memory"})
+            > 0.85
+          for: 10m
+          labels:
+            severity: "p2"
+            team: "platform"
+          annotations:
+            summary: "Container memory usage > 85% of limit"
+            description: "Container {{ $labels.container }} on {{ $labels.pod }} is using {{ $value | humanizePercentage }} of its memory limit. OOM risk."
+
+        # ── gRPC server latency ───────────────────────────────────────────
+        - alert: GRPCHighLatency
+          # The share of a method's calls slower than 2.5s, from the
+          # grpc_server_handling_seconds histogram (go-grpc-prometheus with
+          # EnableHandlingTimeHistogram, or the go-grpc-middleware prometheus
+          # provider). 2.5s is a bucket boundary in both libraries' default
+          # buckets, so the share is exact; a quantile between boundaries would
+          # be interpolated and could cross the threshold on calls that never
+          # did. Per-method aggregation surfaces a single regressing RPC instead
+          # of being hidden by the fleet aggregate. Traffic floor at 0.05 req/s
+          # (~3/min) keeps low-rate methods with a single slow call out of
+          # pager. The floor counts the same calls the share judges, so a busy
+          # bucketless job beside a quiet bucketed one cannot lift a handful of
+          # slow calls over it. If a legitimately heavy RPC starts firing, add a
+          # grpc_method label exclusion rather than raising the threshold.
+          #
+          # The share counts only calls whose histogram has the le="2.5" bucket:
+          # the denominator keeps a count series only beside its own 2.5 bucket,
+          # so a job with other buckets serving the same method neither reads as
+          # slow nor dilutes the share. GRPCLatencyBucketMissing covers that
+          # job's calls, so both alerts can fire for one method when a slow job
+          # and a bucketless job share it.
+          #
+          # The 2.5 bucket that gates the denominator is read through
+          # last_over_time([10m]), the window the rates use, not as a bare
+          # instant selector. A failed scrape writes a staleness marker, so an
+          # instant selector would return nothing for that evaluation, empty the
+          # denominator and restart the 10m `for:`. In a rollout, a replaced
+          # pod's bucket and count keep their rates for 10m, but an instant
+          # selector would drop its count from the denominator within minutes
+          # while its bucket stayed in the numerator, and the share would read
+          # below 0. GRPCLatencyBucketMissing reads the bucket the same way.
+          #
+          # Keep `for:` at 10m or more. When a histogram stops exporting its 2.5
+          # bucket, last_over_time keeps the old bucket beside the still-rising
+          # count for up to 10m while the bucket's own rate fades, so the share
+          # reads high for up to 10m. A 10m `for:` keeps that from paging.
+          #
+          # A service whose handlers are slow by design (a streaming or batch
+          # RPC) is excluded by adding grpc_service!~"<pattern>" to every
+          # selector below.
+          #
+          # Not 0.01: in floating point 1 - 0.99 is 0.010000000000000009, so exactly 1% would fire.
+          expr: |
+            1 - sum by (grpc_service, grpc_method) (rate(grpc_server_handling_seconds_bucket{le="2.5"}[10m]))
+              / sum by (grpc_service, grpc_method) (
+                  rate(grpc_server_handling_seconds_count[10m])
+                  and ignoring (le) last_over_time(grpc_server_handling_seconds_bucket{le="2.5"}[10m])
+                )
+            > 0.010000001
+            and
+            sum by (grpc_service, grpc_method) (
+              rate(grpc_server_handling_seconds_count[10m])
+              and ignoring (le) last_over_time(grpc_server_handling_seconds_bucket{le="2.5"}[10m])
+            ) > 0.05
+          for: 10m
+          labels:
+            severity: "p2"
+            team: "platform"
+          annotations:
+            summary: "gRPC method {{ $labels.grpc_service }}/{{ $labels.grpc_method }}: more than 1% of calls slower than 2.5s"
+            # humanizePercentage keeps four significant digits, so a share just over 1% prints as 1%.
+            description: "{{ $share := humanizePercentage $value }}{{ if eq $share \"1%\" }}Just over 1%{{ else }}{{ $share }}{{ end }} of calls to {{ $labels.grpc_service }}/{{ $labels.grpc_method }} took longer than 2.5s over 10m. A user-facing RPC that slow points to a handler regression — check the handler's downstream dependencies (database, external APIs)."
+
+        # GRPCHighLatency reads the le="2.5" bucket, which go-grpc-prometheus's default
+        # buckets (0.005 to 10s) carry. Calls whose histogram has no such bucket (custom
+        # buckets, or +Inf only) cannot be judged, so when they exceed the same traffic floor
+        # this alert fires instead of the latency alert staying silent. It counts only those
+        # calls, series by series: when a job with the bucket and a job without it serve one
+        # method, this fires for the second job's traffic, and GRPCHighLatency can fire too.
+        # The bucket is read through last_over_time([10m]), as in GRPCHighLatency, so a
+        # missed scrape or a replaced pod does not count a bucketed series as bucketless.
+        - alert: GRPCLatencyBucketMissing
+          expr: |
+            sum by (grpc_service, grpc_method) (
+              rate(grpc_server_handling_seconds_count[10m])
+              unless ignoring (le) last_over_time(grpc_server_handling_seconds_bucket{le="2.5"}[10m])
+            ) > 0.05
+          for: 10m
+          labels:
+            severity: "p2"
+            team: "platform"
+          annotations:
+            summary: "gRPC method {{ $labels.grpc_service }}/{{ $labels.grpc_method }}: latency cannot be judged, histogram has no 2.5s bucket"
+            description: "{{ $labels.grpc_service }}/{{ $labels.grpc_method }} serves traffic, but its grpc_server_handling_seconds histogram has no le=\"2.5\" bucket, so GRPCHighLatency cannot judge it. go-grpc-prometheus's default buckets (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10) include it: restore them, or add 2.5 to your own buckets."

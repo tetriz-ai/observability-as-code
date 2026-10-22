@@ -1,0 +1,37 @@
+# External community dashboards pulled from grafana.com.
+# Each dashboard is published on grafana.com under its author's terms; checking them is your
+# responsibility.
+#
+# This file is the source of truth for which community dashboards the generator copies.
+# Edit this file to manage the set, then run the sync commands.
+#
+#   make dashboards-sync       # fetch each entry that has no JSON file yet
+#   make dashboards-upgrade    # fetch every entry again, overwriting its JSON
+#
+# To remove a dashboard, delete its entry here and delete external/<name>.json.
+#
+# Fields:
+#   name           — short filename, becomes external/<name>.json
+#   grafana_com_id — numeric ID from the grafana.com URL (e.g. 13646)
+#   uid            — short stable uid for your Grafana (e.g. k8s-pvc)
+#
+#   revision       — optional positive revision number; omit to fetch latest
+#
+# Set revision for repeatable downloads. --refresh fetches that revision again.
+
+dashboards:
+  - name: k8s-persistent-volumes
+    grafana_com_id: 13646
+    uid: k8s-pvc
+
+  - name: k8s-views-pods
+    grafana_com_id: 15760
+    uid: k8s-pods
+
+  - name: k8s-views-global
+    grafana_com_id: 15757
+    uid: k8s-global
+
+  - name: postgresql-database
+    grafana_com_id: 9628
+    uid: postgres

@@ -1,0 +1,157 @@
+{
+  "accent": "#a36324",
+  "disclosure": "Actual Grafana render \u00b7 synthetic local metrics \u00b7 Prometheus alert tests use fixed input series",
+  "scenes": [
+    {
+      "title": "Readable source becomes a real dashboard.",
+      "blocks": [
+        {
+          "label": "GO BUILDER",
+          "rows": [
+            "dashboard.NewDashboardBuilder(",
+            "  \"Asynq Queue Health\")",
+            "",
+            "WithPanel( \u2026 )"
+          ],
+          "box": [
+            36,
+            151,
+            420,
+            413
+          ],
+          "kind": "code",
+          "size": 19
+        },
+        {
+          "label": "GENERATED GRAFANA DASHBOARD",
+          "rows": [],
+          "box": [
+            490,
+            151,
+            574,
+            413
+          ],
+          "kind": "image",
+          "file": "grafana.png"
+        }
+      ],
+      "arrows": [
+        [
+          456,
+          350,
+          490,
+          350
+        ]
+      ]
+    },
+    {
+      "title": "See queue health in Grafana.",
+      "blocks": [
+        {
+          "label": "ASYNQ QUEUE HEALTH \u00b7 SYNTHETIC METRICS",
+          "box": [
+            36,
+            145,
+            1028,
+            440
+          ],
+          "kind": "image",
+          "file": "grafana.png"
+        }
+      ],
+      "arrows": []
+    },
+    {
+      "title": "Test the alert before it pages anyone.",
+      "blocks": [
+        {
+          "label": "MISTYPED THRESHOLD",
+          "rows": [
+            "10% failures in the test",
+            "",
+            "error_rate > 0.5",
+            {
+              "text": "Expected alert. Got none.",
+              "color": "#ffb5a9"
+            }
+          ],
+          "box": [
+            36,
+            151,
+            488,
+            413
+          ],
+          "kind": "code",
+          "size": 21
+        },
+        {
+          "label": "PROMTOOL UNIT TEST",
+          "rows": [
+            {
+              "text": "CheckoutErrorRateHigh",
+              "state": "accent"
+            },
+            {
+              "text": "FAILED \u00b7 got: []",
+              "state": "bad"
+            },
+            "The alert would stay silent"
+          ],
+          "box": [
+            576,
+            151,
+            488,
+            413
+          ],
+          "kind": "rows"
+        }
+      ],
+      "arrows": []
+    },
+    {
+      "title": "Correct the rule. Prove it fires.",
+      "blocks": [
+        {
+          "label": "FIXED THRESHOLD",
+          "rows": [
+            "error_rate > 0.05",
+            "",
+            "for: 10m",
+            {
+              "text": "10% errors \u2192 alert fires",
+              "color": "#9ce0bb"
+            }
+          ],
+          "box": [
+            36,
+            151,
+            488,
+            413
+          ],
+          "kind": "code"
+        },
+        {
+          "label": "VERIFIED LOCALLY",
+          "rows": [
+            {
+              "text": "Alert tests: SUCCESS",
+              "state": "good"
+            },
+            "Low error rate stays quiet",
+            "Low traffic stays quiet"
+          ],
+          "box": [
+            576,
+            151,
+            488,
+            413
+          ],
+          "kind": "rows"
+        }
+      ],
+      "arrows": []
+    }
+  ],
+  "name": "observability-as-code",
+  "output": "demo.gif"
+}

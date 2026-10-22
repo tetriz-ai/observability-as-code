@@ -1,0 +1,15 @@
+Copyright 2026 Workloom Solutions Private Limited
+observability-as-code
+
+This repository includes the following third-party material:
+
+- CODE_OF_CONDUCT.md is adapted from the Contributor Covenant, version 2.1,
+  Copyright Organization for Ethical Source.
+  https://www.contributor-covenant.org/version/2/1/code_of_conduct/,
+  licensed under CC BY 4.0, https://creativecommons.org/licenses/by/4.0/.
+- dashboards/helpers.go: defaultTimeseries, allSelected and the query, variable and stat helpers
+  are adapted, with changes, from the linux-node-overview example of the Grafana Foundation SDK.
+  Source: https://github.com/grafana/grafana-foundation-sdk/tree/main/examples/go/linux-node-overview
+  Copyright 2024 Grafana Labs.
+  Licensed under the Apache License 2.0; the license text is in
+  third_party/grafana-foundation-sdk/LICENSE.

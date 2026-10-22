@@ -1,0 +1,45 @@
+Captured locally on 2026-10-20 using the synthetic examples below.
+
+Reproduction commands (repository root):
+make dashboards
+make examples EXAMPLE=catch-a-broken-alert
+make examples EXAMPLE=add-an-alert-rule
+make test-alerts
+# Grafana screenshot: actual asynq-queue-health dashboard, fixture metrics.py, 5 minute range.
+
+Observed output:
+Testing alert rules...
+  SUCCESS
+
+  FAILED:
+    alertname: CheckoutErrorRateHigh, time: 20m,
+        exp:[
+            0:
+              Labels:{alertname="CheckoutErrorRateHigh", severity="p1", team="checkout"}
+              Annotations:{description="10% of checkout calls failed over the last 5m.", summary="Checkout error rate above 5%"}
+            ],
+        got:[]
+
+
+  SUCCESS
+
+make test-alerts failed: the case that should fire at 10% errors got no alert
+Validating alert rules...
+Checking /dev/stdin
+  SUCCESS: 7 rules found
+
+  ✓ alerts/rules-asynq.yaml (promtool)
+Checking /dev/stdin
+  SUCCESS: 1 rules found
+
+  ✓ alerts/rules-checkout.yaml (promtool)
+Checking /dev/stdin
+  SUCCESS: 5 rules found
+
+  ✓ alerts/rules-platform.yaml (promtool)
+Testing alert rules...
+  SUCCESS
+
+  SUCCESS
+
+  SUCCESS

@@ -1,0 +1,13 @@
+# Prometheus for the local preview. It scrapes only itself. To see a service on your machine on
+# the dashboards, add a job with the target host.docker.internal:<port>, for example:
+#
+#   - job_name: my-service
+#     static_configs:
+#       - targets: ["host.docker.internal:8080"]
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

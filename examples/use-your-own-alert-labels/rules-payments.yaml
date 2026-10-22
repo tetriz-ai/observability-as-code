@@ -1,0 +1,26 @@
+# Copyright 2026 Workloom Solutions Private Limited
+# SPDX-License-Identifier: MIT
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: payments-rules
+  namespace: monitoring
+  labels:
+    role: alert-rules
+spec:
+  groups:
+    - name: payments.rules
+      rules:
+        # Every payments target down for 5m. Routed by an `owner` label, with critical/warning
+        # severities, instead of the repository's default `team` label and p0/p1/p2.
+        - alert: PaymentsDown
+          expr: |
+            max by (job) (up{job="payments"}) == 0
+          for: 5m
+          labels:
+            severity: "critical"
+            owner: "payments"
+          annotations:
+            summary: "Every payments target is down"
+            description: "No payments target has answered a scrape for 5m."

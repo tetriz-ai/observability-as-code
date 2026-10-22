@@ -1,0 +1,55 @@
+# Local preview of the generated dashboards: Prometheus plus a Grafana that provisions every
+# file in the generator's output directory. `make dev-monitoring` generates the dashboards and
+# starts both; `make dev-monitoring-down` stops them.
+#
+# Every port binds to 127.0.0.1 only. Grafana keeps its stock local admin login (admin/admin)
+# and lets anonymous visitors view dashboards: for localhost use only.
+#
+# The grafana-blank service (profile "acceptance") is an empty Grafana that
+# scripts/acceptance.sh imports the dashboards into.
+services:
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    # host.docker.internal reaches a service running on the host, on Linux as on Docker Desktop.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  grafana:
+    image: grafana/grafana-oss:13.0.2
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_DASHBOARDS_PATH: /var/lib/grafana/dashboards
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ${DASHBOARDS_OUT:-./dashboards/output}:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  grafana-blank:
+    profiles: [acceptance]
+    image: grafana/grafana-oss:13.0.2
+    ports:
+      - "127.0.0.1:${ACCEPTANCE_GRAFANA_PORT:-3001}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30

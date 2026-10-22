@@ -1,0 +1,10 @@
+--- a/dashboards/main.go
++++ b/dashboards/main.go
+@@ -43,6 +43,7 @@
+ 	return []dashboardDef{
+ 		{name: "asynq-queue-health", builder: asynqQueueDashboard()},
+ 		{name: "redis-command-health", builder: redisCommandDashboard()},
++		{name: "go-runtime", builder: goRuntimeDashboard()},
+ 	}
+ }
+ 

@@ -1,0 +1,5 @@
+exclusions:
+  target-instance-rule:
+    reason: "Panels aggregate across instances (max or sum by queue / client); an instance filter would split values every replica reports identically"
+  template-instance-rule:
+    reason: "Panels aggregate across instances (max or sum by queue / client); no instance variable is needed"

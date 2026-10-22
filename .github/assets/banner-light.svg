@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="200" viewBox="0 0 880 200" role="img" aria-labelledby="title desc">
+  <title id="title">observability-as-code</title>
+  <desc id="desc">Grafana dashboards written in Go, Prometheus alert rules with unit tests, both checked in CI.</desc>
+  <rect width="880" height="200" fill="#ffffff"/>
+  <g transform="translate(40 36)">
+    <rect x="0" y="0" width="176" height="128" rx="10" fill="#f6f8fa" stroke="#d1d9e0" stroke-width="1.5"/>
+    <text x="14" y="26" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" fill="#59636e">func queue()</text>
+    <line x1="14" y1="98" x2="162" y2="98" stroke="#d1d9e0" stroke-width="1"/>
+    <rect x="22" y="70" width="14" height="28" rx="2" fill="#8c959f"/>
+    <rect x="44" y="58" width="14" height="40" rx="2" fill="#8c959f"/>
+    <rect x="66" y="78" width="14" height="20" rx="2" fill="#8c959f"/>
+    <polyline points="92,84 108,66 124,74 140,50 156,58" fill="none" stroke="#0969da" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="14" y="118" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#59636e">→ dashboard.json</text>
+    <circle cx="168" cy="122" r="20" fill="#1a7f37"/>
+    <polyline points="158,122 165,129 179,114" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="248" y="88" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="38" font-weight="700" fill="#1f2328">observability-as-code</text>
+  <text x="248" y="124" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" fill="#59636e">Grafana dashboards written in Go, Prometheus alert rules</text>
+  <text x="248" y="150" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" fill="#59636e">with unit tests, both checked in CI.</text>
+</svg>

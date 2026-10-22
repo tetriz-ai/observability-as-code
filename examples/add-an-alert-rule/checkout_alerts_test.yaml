@@ -1,0 +1,48 @@
+# Copyright 2026 Workloom Solutions Private Limited
+# SPDX-License-Identifier: MIT
+
+rule_files:
+  - ../.extracted/rules-checkout.yaml
+evaluation_interval: 1m
+tests:
+  # 120 calls a minute, 12 of them failing (10%) -> fires once it has held for 10m.
+  - interval: 1m
+    input_series:
+      - series: 'grpc_server_handled_total{grpc_service="shop.Checkout", grpc_method="Pay", grpc_code="OK"}'
+        values: '0+108x30'
+      - series: 'grpc_server_handled_total{grpc_service="shop.Checkout", grpc_method="Pay", grpc_code="Unavailable"}'
+        values: '0+12x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CheckoutErrorRateHigh
+        exp_alerts:
+          - exp_labels:
+              severity: p1
+              team: checkout
+            exp_annotations:
+              summary: "Checkout error rate above 5%"
+              description: "10% of checkout calls failed over the last 5m."
+
+  # 1 failure in 120 calls a minute (0.8%) -> silent.
+  - interval: 1m
+    input_series:
+      - series: 'grpc_server_handled_total{grpc_service="shop.Checkout", grpc_method="Pay", grpc_code="OK"}'
+        values: '0+119x30'
+      - series: 'grpc_server_handled_total{grpc_service="shop.Checkout", grpc_method="Pay", grpc_code="Unavailable"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CheckoutErrorRateHigh
+        exp_alerts: []
+
+  # Half of 30 calls a minute failing (0.5 calls a second, under the floor) -> silent.
+  - interval: 1m
+    input_series:
+      - series: 'grpc_server_handled_total{grpc_service="shop.Checkout", grpc_method="Pay", grpc_code="OK"}'
+        values: '0+15x30'
+      - series: 'grpc_server_handled_total{grpc_service="shop.Checkout", grpc_method="Pay", grpc_code="Unavailable"}'
+        values: '0+15x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CheckoutErrorRateHigh
+        exp_alerts: []

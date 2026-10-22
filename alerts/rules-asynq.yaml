@@ -1,0 +1,250 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: asynq-rules
+  namespace: monitoring
+  labels:
+    role: alert-rules
+spec:
+  groups:
+    - name: asynq.rules
+      rules:
+        # ── Queue health for asynq, from the series the x/metrics.QueueMetricsCollector
+        #    already exports (the same ones the "Asynq Queue Health" dashboard reads).
+        #    Every replica that registers the collector reports identical values for
+        #    every queue, so every series is deduped across replicas with max by (job, queue)
+        #    (or min by (job, queue) where the window function is min — see below) before
+        #    any arithmetic. Grouping by job as well as queue keeps two services that both
+        #    use asynq's stock queue name "default" apart.
+        #
+        #    So register the collector in one job per Redis. A second job exporting the same
+        #    Redis (an API that enqueues beside the worker that processes, say) reports the
+        #    same queues under its own job label, which doubles every total and fires every
+        #    rule below once per job. To keep scraping that job, drop its asynq_ series with
+        #    metric_relabel_configs (README, "When two jobs export the same Redis").
+        #
+        #    The collector is all-or-nothing per scrape: one failed Inspector call drops
+        #    every asynq series for that scrape, and a bare instant selector would then
+        #    return nothing and reset a `for:` window. Every selector is therefore a range
+        #    read. Which window function depends on what the condition means:
+        #      min_over_time  for a state that must be SUSTAINED to matter — pending,
+        #                     oldest-pending age, and the pause AsynqQueuePaused reports.
+        #                     A burst that drains within minutes must not count.
+        #      max_over_time  for a state whose ANY occurrence settles the question —
+        #                     active (any activity means the queue drains), and the pause
+        #                     the other rules exclude (any pause explains the backlog).
+        #    Counters are compared as differences inside the rule's own window
+        #    (max_over_time minus min_over_time), never rate()/increase(): the difference is
+        #    integer-accurate, needs no sample from before the series began, and a counter
+        #    that went backwards inside the window (a Redis key loss) drops the queue for
+        #    that window instead of skewing the share. The [5m] windows only ever delay: a
+        #    min_over_time condition turns true up to 5m after the state begins, and a
+        #    max_over_time exclusion lifts up to 5m after it ends, so an alert can fire up to
+        #    5m later than its `for:` says. The tests start every series at t=0, where the
+        #    window holds no earlier sample, which hides this delay.
+        #
+        #    A paused queue (an operator's Inspector.PauseQueue) is excluded from every
+        #    rule that would otherwise misdiagnose its growing backlog; AsynqQueuePaused is
+        #    the one rule that names it. A queue that holds a backlog by design is excluded
+        #    by adding queue!~"<name>" to the pending and latency selectors of
+        #    AsynqQueueBacklogHigh and AsynqOldestPendingStale.
+
+        # ── A queue with a backlog and no active worker on it for 30m is not being
+        #    drained; the description owns the cause list. `active` is required to be zero
+        #    so a slow concurrency-1 queue mid-task is not mistaken for a stuck one.
+        #    A queue whose processed counter rose in the last 5m is draining, however short
+        #    its tasks: asynq polls a queue it found empty about once a second, so a busy
+        #    queue of short tasks shows a task or two pending at almost every scrape and
+        #    almost never one active. The last clause is `unless`, not `and`, so a queue
+        #    with no processed series is still judged on pending and active alone.
+        - alert: AsynqQueueNotDraining
+          expr: |
+            min by (job, queue) (min_over_time(asynq_tasks_enqueued_total{state="pending"}[5m])) > 0
+            and
+            max by (job, queue) (max_over_time(asynq_tasks_enqueued_total{state="active"}[5m])) == 0
+            unless
+            max by (job, queue) (max_over_time(asynq_queue_paused_total[5m])) > 0
+            unless
+            max by (job, queue) (max_over_time(asynq_tasks_processed_total[5m]) - min_over_time(asynq_tasks_processed_total[5m])) > 0
+          for: 30m
+          labels:
+            severity: "p1"
+            team: "platform"
+          annotations:
+            summary: "asynq queue {{ $labels.queue }} has a backlog and nothing is processing it"
+            description: "{{ $value | humanize }} tasks have sat pending on the {{ $labels.queue }} queue for 30m with zero active workers on it and the queue is not paused. Possible causes: the worker pool is saturated and this low-priority queue keeps losing the draw (other queues show active > 0 — check the server's Concurrency and Queues priorities); no running server lists this queue in its Config.Queues (a retired queue's leftovers stay in Redis until deleted with Inspector.DeleteQueue); or the worker process is down. Start on the Asynq Queue Health dashboard, Backlog by State."
+
+        # ── A paused queue is an operator action, never something asynq does on its own.
+        #    Fine for an incident; half an hour later the pause is the thing that needs a
+        #    decision, and every other rule stays silent on a paused queue so this is the
+        #    one that names it. min_over_time: a pause that ended inside the window is over.
+        - alert: AsynqQueuePaused
+          expr: |
+            min by (job, queue) (min_over_time(asynq_queue_paused_total[5m])) > 0
+          for: 30m
+          labels:
+            severity: "p2"
+            team: "platform"
+          annotations:
+            summary: "asynq queue {{ $labels.queue }} has been paused for over 30m"
+            description: "The {{ $labels.queue }} queue is paused, so nothing pulls from it and its backlog only grows. Pausing is a manual Inspector.PauseQueue call and is not undone by a deploy. Unpause it (Inspector.UnpauseQueue) once the incident that motivated it is over."
+
+        # ── Backlog well past what the worker pool clears in a few minutes, and held
+        #    there: min_over_time means the queue never dipped below 1,000 in any 5m window
+        #    for 30m, so a burst that drains within minutes does not count. The dashboard
+        #    uses the same figure as its red line for the all-queue total. Advisory: it
+        #    self-heals if the pool catches up. A paused queue is excluded.
+        - alert: AsynqQueueBacklogHigh
+          expr: |
+            min by (job, queue) (min_over_time(asynq_tasks_enqueued_total{state="pending"}[5m])) > 1000
+            unless
+            max by (job, queue) (max_over_time(asynq_queue_paused_total[5m])) > 0
+          for: 30m
+          labels:
+            severity: "p2"
+            team: "platform"
+          annotations:
+            summary: "asynq queue {{ $labels.queue }} backlog above 1,000 for 30m"
+            description: "{{ $value | humanize }} tasks are pending on the {{ $labels.queue }} queue and it has not dipped below 1,000 for 30m. The worker pool is not clearing what producers enqueue. Check whether a task type on this queue got slow (Asynq Queue Health dashboard, Oldest Pending Age) before raising concurrency."
+
+        # ── The oldest pending task has waited more than 30 minutes, continuously.
+        #    queue_latency_seconds resets to 0 when the queue drains, so this resolves as
+        #    soon as it does. Same exclusion as BacklogHigh.
+        - alert: AsynqOldestPendingStale
+          expr: |
+            min by (job, queue) (min_over_time(asynq_queue_latency_seconds[5m])) > 1800
+            unless
+            max by (job, queue) (max_over_time(asynq_queue_paused_total[5m])) > 0
+          for: 15m
+          labels:
+            severity: "p2"
+            team: "platform"
+          annotations:
+            summary: "asynq queue {{ $labels.queue }} oldest pending task older than 30m"
+            description: "The oldest pending task on the {{ $labels.queue }} queue has waited {{ $value | humanizeDuration }}. Work is arriving faster than this queue drains it; anything scheduled on it is running late by at least that much. Check the queue's throughput and failure rate on the Asynq Queue Health dashboard."
+
+        # ── Failure share of everything the queue processed in the last hour, as the
+        #    counters' differences inside the hour on the deduped series. processed_total
+        #    counts successes AND failures (asynq semantics), so this is failed / all, and
+        #    each retry attempt counts once. A dependency that rejects calls pushes this up
+        #    legitimately, so read a spike against that dependency's own alerts before
+        #    treating it as a broken handler. The >= 20 volume guard stops a single failed
+        #    task on a quiet queue from paging at a meaningless 100%.
+        #
+        #    The last clause keeps only queues whose job reported asynq_tasks_processed_total
+        #    in the last 5m. The [1h] windows keep returning a stopped job's last samples, so
+        #    without it the rule would go on reporting a frozen share for work that is no
+        #    longer happening. A job that stopped reporting is AsynqMetricsAbsent's to page.
+        - alert: AsynqQueueFailureRateHigh
+          expr: |
+            (
+              (
+                (
+                  max by (job, queue) (max_over_time(asynq_tasks_failed_total[1h]))
+                  - min by (job, queue) (min_over_time(asynq_tasks_failed_total[1h]))
+                )
+                /
+                (
+                  max by (job, queue) (max_over_time(asynq_tasks_processed_total[1h]))
+                  - min by (job, queue) (min_over_time(asynq_tasks_processed_total[1h]))
+                )
+              ) > 0.25
+              and
+              (
+                max by (job, queue) (max_over_time(asynq_tasks_processed_total[1h]))
+                - min by (job, queue) (min_over_time(asynq_tasks_processed_total[1h]))
+              ) >= 20
+              unless
+              max by (job, queue) (resets(asynq_tasks_processed_total[1h])) > 0
+              unless
+              max by (job, queue) (resets(asynq_tasks_failed_total[1h])) > 0
+            )
+            and on (job, queue)
+            max by (job, queue) (present_over_time(asynq_tasks_processed_total[5m]))
+          for: 30m
+          labels:
+            severity: "p2"
+            team: "platform"
+          annotations:
+            summary: "asynq queue {{ $labels.queue }} failure rate above 25%"
+            description: "{{ $value | humanizePercentage }} of the tasks processed on the {{ $labels.queue }} queue in the last hour failed (each retry attempt counts once, and a downstream rate-limit error that fails the task counts as a failure). Break it down by task type in the worker logs; a dependency that rejects calls (a rate limit, for one) and a broken handler look the same here, so check the dependency's own alerts before treating it as a code fault."
+
+        # ── The same 25% share over 24h, for queues too quiet for the hourly rule to see:
+        #    under the hourly floor's daily equivalent (20/h x 24h = 480), so at a steady rate
+        #    the two abut. It still asks for >= 5 failures, so one bad task on a queue that
+        #    processed five in a day is not a page.
+        #
+        #    The hand-off is on the hourly rule's firing state, read from ALERTS: while
+        #    AsynqQueueFailureRateHigh fires for a queue, this rule leaves it out, so the two
+        #    never page for one queue at once. Handing off on the hourly volume instead
+        #    (20 or more processed in the last hour) let a queue near 20 an hour flip between
+        #    the two rules every few minutes and restart both `for:` timers, so it never paged.
+        #    This rule must stay in the same group as the hourly rule and after it, so it reads
+        #    this evaluation's state, and renaming the hourly rule means renaming it here too.
+        #    A queue with 480 or more tasks in the day but under 20 in the last hour is judged
+        #    by neither rule.
+        #
+        #    As in the hourly rule, a job that stopped reporting is AsynqMetricsAbsent's: the
+        #    last clause drops it once it has no processed sample in the last 5m.
+        - alert: AsynqQueueFailuresLowVolume
+          expr: |
+            (
+              (
+                (
+                  max by (job, queue) (max_over_time(asynq_tasks_failed_total[24h]))
+                  - min by (job, queue) (min_over_time(asynq_tasks_failed_total[24h]))
+                )
+                /
+                (
+                  max by (job, queue) (max_over_time(asynq_tasks_processed_total[24h]))
+                  - min by (job, queue) (min_over_time(asynq_tasks_processed_total[24h]))
+                )
+              ) > 0.25
+              and
+              (
+                max by (job, queue) (max_over_time(asynq_tasks_failed_total[24h]))
+                - min by (job, queue) (min_over_time(asynq_tasks_failed_total[24h]))
+              ) >= 5
+              and
+              (
+                max by (job, queue) (max_over_time(asynq_tasks_processed_total[24h]))
+                - min by (job, queue) (min_over_time(asynq_tasks_processed_total[24h]))
+              ) < 480
+              unless
+              max by (job, queue) (resets(asynq_tasks_processed_total[24h])) > 0
+              unless
+              max by (job, queue) (resets(asynq_tasks_failed_total[24h])) > 0
+              unless on (job, queue)
+              ALERTS{alertname="AsynqQueueFailureRateHigh", alertstate="firing"}
+            )
+            and on (job, queue)
+            max by (job, queue) (present_over_time(asynq_tasks_processed_total[5m]))
+          for: 1h
+          labels:
+            severity: "p2"
+            team: "platform"
+          annotations:
+            summary: "asynq queue {{ $labels.queue }} failure rate above 25% over 24h on a low-volume queue"
+            description: "{{ $value | humanizePercentage }} of the tasks processed on the {{ $labels.queue }} queue in the last 24h failed, on a queue too quiet for the hourly failure-rate rule to see. Find the failing task type in the worker logs or the queue's archived tasks, and check its handler."
+
+        # ── The exporter for every rule above is the asynq collector; if a job that
+        #    reported asynq series in the last day has reported none for 15m, the queue
+        #    rules for that job are blind, not green. A process that is fully down is a
+        #    target-down alert's job — this is the process up but its collector failing, or
+        #    the target gone from discovery. The second branch fires when no asynq series
+        #    exists at all in the last day, including in a Prometheus that has never
+        #    scraped asynq. No `for:`: the 15m lookback already carries the dwell. A job
+        #    silent for over a day drops out of the first branch, as a retired job would.
+        - alert: AsynqMetricsAbsent
+          expr: |
+            group by (job) (present_over_time(asynq_tasks_enqueued_total[1d]))
+            unless
+            group by (job) (present_over_time(asynq_tasks_enqueued_total[15m]))
+            or
+            absent_over_time(asynq_tasks_enqueued_total[1d])
+          labels:
+            severity: "p2"
+            team: "platform"
+          annotations:
+            summary: "asynq queue metrics are not being scraped — the queue alerts are blind"
+            description: "No asynq_* series has been scraped in the last 15 minutes{{ with $labels.job }} for job {{ . }}{{ end }}, so every Asynq* rule that depends on it evaluates against nothing and cannot fire. Either the process running the collector is not being scraped, or the x/metrics collector is failing on every scrape (it drops all series when one Inspector call to Redis fails). Check that process's /metrics for asynq_ series and its Redis connectivity."
