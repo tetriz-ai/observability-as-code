@@ -7,6 +7,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Go 1.23+](https://img.shields.io/badge/go-1.23%2B-00ADD8.svg)](go.mod)
 
+<a href="https://www.producthunt.com/products/agentic-workflow-kit?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-tetriz-engineering-kit" target="_blank" rel="noopener noreferrer"><img alt="Tetriz Engineering Kit  - Open-source tools for everything around AI coding | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1296838&amp;theme=light&amp;t=1793345913841"></a>
+
 For a team that keeps Grafana dashboards and Prometheus alerts in git, a dashboard edited as JSON
 gives a reviewer nothing to read, and an alert nobody has tested may never fire when it should.
 Clone this repository, and a dashboard or alert change arrives as a readable diff that lint and
